@@ -20,7 +20,7 @@ app.use(cors());
 app.use(json());
 
 app.get('/', (req, res) => {
-    res.send(`Harmonix Backend is Running! ${process.env.TEST}`);
+    res.send(`Harmonix Backend is Running!`);
 });
 
 app.listen(PORT, () => {
