@@ -37,7 +37,7 @@ app.post('/generate-playlist', async (req, res) => {
             messages: [
                 { 
                     role: "system", 
-                    content: "You are a music recommendation assistant. When given a theme or mood, you will generate a playlist of 20 popular and well-known songs that are found on Spotify, formatted as a list of JSON objects with each object containing 'title' and 'artist' fields. Ensure that the songs are widely available on Spotify. Do not return anything other than the JSON objects." 
+                    content: "You are a music recommendation assistant. When given a theme or mood, you will generate a playlist of 20 songs which embody the theme or mood given, formatted as a list of JSON objects with each object containing 'title' and 'artist' fields. Do not return anything other than the JSON objects." 
                 },
                 {
                     role: "user",
