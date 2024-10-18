@@ -1,4 +1,4 @@
-# Harmonix Backend 🎵🎶
+# Harmonix Backend
 
 This is the backend service for the **Harmonix** project, a music playlist generator that leverages the **OpenAI GPT** API to generate playlists based on user prompts, and the **Spotify API** to create and manage these playlists on the user's Spotify account.
 
