@@ -60,7 +60,7 @@ app.post('/generate-playlist', async (req, res) => {
 // Spotify Authentication Route
 app.get('/spotify/login', (req, res) => {
      // Add required scopes for playlist modification
-        const scope = 'user-read-private user-read-email playlist-modify-public playlist-modify-private';
+        const scope = 'user-read-private user-read-email playlist-modify-public playlist-modify-private user-library-read';
         const queryParams = querystring.stringify({
         client_id: process.env.SPOTIFY_CLIENT_ID,
         response_type: 'code',
@@ -155,13 +155,23 @@ app.post('/spotify/create-playlist', async (req, res) => {
 
 
 
-// Endpoint to Add Tracks to Spotify Playlist
-app.post('/spotify/add-tracks', async (req, res) => {
-    const { playlistId, tracks, accessToken } = req.body;  // tracks are song titles and artists from OpenAI
+// New endpoint to validate tracks and get recommendations if needed
+app.post('/validate-tracks', async (req, res) => {
+    const { tracks, accessToken } = req.body;
+    
+    // Simple debug counters
+    const stats = {
+        totalRequested: tracks.length,
+        validTracks: 0,
+        invalidTracks: 0,
+        recommendedTracks: 0
+    };
 
     try {
-        // Search each track and get the track URIs
-        const trackUris = await Promise.all(tracks.map(async (track) => {
+        console.log(`[INFO] Validating ${tracks.length} tracks against Spotify`);
+        
+        // Step 1: Search and validate each track on Spotify
+        const trackResults = await Promise.all(tracks.map(async (track) => {
             try {
                 const response = await axios.get(`https://api.spotify.com/v1/search`, {
                     headers: {
@@ -174,32 +184,283 @@ app.post('/spotify/add-tracks', async (req, res) => {
                     }
                 });
                 
-                // Check if the search result contains at least one track
                 if (response.data.tracks.items.length > 0) {
-                    return response.data.tracks.items[0].uri; // Get the track URI
+                    const spotifyTrack = response.data.tracks.items[0];
+                    stats.validTracks++;
+                    
+                    // Get the artist to extract genre information
+                    const artistId = spotifyTrack.artists[0].id;
+                    let genres = [];
+                    
+                    try {
+                        const artistResponse = await axios.get(`https://api.spotify.com/v1/artists/${artistId}`, {
+                            headers: {
+                                Authorization: `Bearer ${accessToken}`,
+                            }
+                        });
+                        
+                        if (artistResponse.data && artistResponse.data.genres) {
+                            genres = artistResponse.data.genres;
+                            console.log(`[SUCCESS] Found genres for ${spotifyTrack.artists[0].name}: ${genres.join(', ')}`);
+                        }
+                    } catch (artistError) {
+                        console.error(`[ERROR] Error getting artist genres: ${artistError.message}`);
+                    }
+                    
+                    return {
+                        title: spotifyTrack.name,
+                        artist: spotifyTrack.artists[0].name,
+                        album: spotifyTrack.album.name,
+                        image: spotifyTrack.album.images[0]?.url,
+                        uri: spotifyTrack.uri,
+                        id: spotifyTrack.id,
+                        artist_id: artistId,
+                        genres: genres,
+                        valid: true
+                    };
                 } else {
-                    console.warn(`No track found for: ${track.title} by ${track.artist}`);
-                    return null; // Return null if no track found
+                    stats.invalidTracks++;
+                    return { 
+                        title: track.title, 
+                        artist: track.artist,
+                        valid: false 
+                    };
                 }
             } catch (error) {
-                console.error(`Error searching for track: ${track.title} by ${track.artist}`, error);
-                return null; // Return null on error, so it doesn't break the Promise.all
+                stats.invalidTracks++;
+                return { 
+                    title: track.title, 
+                    artist: track.artist,
+                    valid: false 
+                };
             }
         }));
 
-        // Filter out any null values (tracks that were not found)
-        const validTrackUris = trackUris.filter(uri => uri !== null);
+        // Filter valid tracks
+        const validTracks = trackResults.filter(result => result.valid);
+        
+        console.log(`[SUCCESS] Found ${validTracks.length} valid tracks out of ${tracks.length}`);
+        
+        // Step 2: If we have fewer than 20 valid tracks, get tracks from similar genres
+        let recommendedTracks = [];
+        if (validTracks.length < 20 && validTracks.length > 0) {
+            // Collect all genres from validated tracks
+            const allGenres = [];
+            validTracks.forEach(track => {
+                if (track.genres && track.genres.length > 0) {
+                    allGenres.push(...track.genres);
+                }
+            });
+            
+            // If we don't have any genres, use some popular ones as fallback
+            if (allGenres.length === 0) {
+                console.log('[WARNING] No genres found in validated tracks, using fallback genres');
+                allGenres.push('pop', 'rock', 'hip hop', 'electronic', 'indie');
+            }
+            
+            console.log(`[INFO] Found ${allGenres.length} total genres across all tracks`);
+            
+            // Get unique genres while preserving frequency (more common genres will appear more often)
+            const uniqueGenres = [...allGenres];
+            
+            // Calculate how many more tracks we need
+            const neededTracks = 20 - validTracks.length;
+            console.log(`[INFO] Need to find ${neededTracks} more tracks to complete the playlist`);
+            
+            // Rotate through genres to find additional tracks
+            let genreIndex = 0;
+            let attempts = 0;
+            const maxAttempts = uniqueGenres.length * 2; // Avoid infinite loop
+            
+            while (recommendedTracks.length < neededTracks && attempts < maxAttempts) {
+                const currentGenre = uniqueGenres[genreIndex % uniqueGenres.length];
+                genreIndex++;
+                attempts++;
+                
+                try {
+                    console.log(`[INFO] Searching for a track in genre: ${currentGenre}`);
+                    
+                    const response = await axios.get(`https://api.spotify.com/v1/search`, {
+                        headers: {
+                            Authorization: `Bearer ${accessToken}`,
+                        },
+                        params: {
+                            q: `genre:${currentGenre}`,
+                            type: 'track',
+                            limit: 50 // Get more results to increase chance of finding unique tracks
+                        }
+                    });
+                    
+                    if (response.data.tracks.items.length > 0) {
+                        // Filter out tracks we already have (both in validated and recommended)
+                        const existingIds = [...validTracks, ...recommendedTracks].map(t => t.id);
+                        const newTracks = response.data.tracks.items.filter(t => !existingIds.includes(t.id));
+                        
+                        if (newTracks.length > 0) {
+                            // Pick a random track from the results to add variety
+                            const randomIndex = Math.floor(Math.random() * newTracks.length);
+                            const selectedTrack = newTracks[randomIndex];
+                            
+                            recommendedTracks.push({
+                                title: selectedTrack.name,
+                                artist: selectedTrack.artists[0].name,
+                                album: selectedTrack.album.name,
+                                image: selectedTrack.album.images[0]?.url,
+                                uri: selectedTrack.uri,
+                                id: selectedTrack.id,
+                                genres: [currentGenre], // Store the genre we searched for
+                                valid: true,
+                                recommended: true
+                            });
+                            
+                            console.log(`[SUCCESS] Added track "${selectedTrack.name}" by ${selectedTrack.artists[0].name} from genre ${currentGenre}`);
+                        } else {
+                            console.log(`[WARNING] No new tracks found for genre ${currentGenre}`);
+                        }
+                    } else {
+                        console.log(`[WARNING] No tracks found for genre ${currentGenre}`);
+                    }
+                } catch (error) {
+                    console.error(`[ERROR] Error searching for tracks in genre ${currentGenre}:`, error.message);
+                    if (error.response) {
+                        console.error(`Status: ${error.response.status}`);
+                        console.error('Error data:', JSON.stringify(error.response.data));
+                    }
+                }
+            }
+            
+            stats.recommendedTracks = recommendedTracks.length;
+            console.log(`[SUCCESS] Added ${recommendedTracks.length} tracks from similar genres`);
+        }
 
-        // Log the playlistId and track URIs for debugging
-        console.log('Playlist ID:', playlistId);
-        console.log('Valid Track URIs:', validTrackUris);
+        // Combine valid tracks with recommended tracks
+        const finalPlaylist = [...validTracks, ...recommendedTracks];
+        
+        // Return the validated playlist
+        res.json({
+            message: 'Tracks validated',
+            stats: {
+                originalRequested: stats.totalRequested,
+                validOriginal: stats.validTracks,
+                invalidOriginal: stats.invalidTracks,
+                recommended: stats.recommendedTracks,
+                totalValid: finalPlaylist.length
+            },
+            playlist: finalPlaylist
+        });
+    } catch (error) {
+        console.error('[ERROR] Error validating tracks:', error.message);
+        res.status(500).json({ 
+            error: 'Failed to validate tracks',
+            details: error.message
+        });
+    }
+});
 
-        // If there are valid URIs, add them to the playlist
-        if (validTrackUris.length > 0) {
-            const addTracksResponse = await axios.post(
+// Update the add-tracks endpoint to handle recommendations properly
+app.post('/spotify/add-tracks', async (req, res) => {
+    const { playlistId, tracks, accessToken } = req.body;
+    
+    // Simple debug counters
+    const stats = {
+        totalRequested: tracks.length,
+        validTracks: 0,
+        invalidTracks: 0,
+        recommendedTracks: 0
+    };
+
+    try {
+        console.log(`[INFO] Processing ${tracks.length} tracks for playlist ${playlistId}`);
+        
+        // Step 1: Validate each track
+        const trackResults = await Promise.all(tracks.map(async (track) => {
+            try {
+                // If the track already has a URI, use it directly
+                if (track.uri) {
+                    // Check if it's a recommended track
+                    if (track.recommended) {
+                        stats.recommendedTracks++;
+                    } else {
+                        stats.validTracks++;
+                    }
+                    
+                    return {
+                        original: track,
+                        valid: true,
+                        uri: track.uri,
+                        id: track.id,
+                        recommended: !!track.recommended,
+                        spotifyData: {
+                            title: track.title,
+                            artist: track.artist,
+                            album: track.album || '',
+                            image: track.image || ''
+                        }
+                    };
+                }
+                
+                // Otherwise search for it
+                const response = await axios.get(`https://api.spotify.com/v1/search`, {
+                    headers: {
+                        Authorization: `Bearer ${accessToken}`,
+                    },
+                    params: {
+                        q: `track:${track.title} artist:${track.artist}`,
+                        type: 'track',
+                        limit: 1,
+                    }
+                });
+                
+                if (response.data.tracks.items.length > 0) {
+                    const spotifyTrack = response.data.tracks.items[0];
+                    stats.validTracks++;
+                    return {
+                        original: track,
+                        valid: true,
+                        uri: spotifyTrack.uri,
+                        id: spotifyTrack.id,
+                        recommended: false,
+                        spotifyData: {
+                            title: spotifyTrack.name,
+                            artist: spotifyTrack.artists[0].name,
+                            album: spotifyTrack.album.name,
+                            image: spotifyTrack.album.images[0]?.url
+                        }
+                    };
+                } else {
+                    stats.invalidTracks++;
+                    return { original: track, valid: false };
+                }
+            } catch (error) {
+                stats.invalidTracks++;
+                return { original: track, valid: false };
+            }
+        }));
+
+        // Filter valid tracks
+        const validTracks = trackResults.filter(result => result.valid && !result.recommended);
+        const recommendedTracks = trackResults.filter(result => result.valid && result.recommended);
+        
+        // Extract URIs, ensuring they're in the correct format
+        const validTrackUris = validTracks.map(track => track.uri);
+        const recommendedTrackUris = recommendedTracks.map(track => track.uri);
+        
+        // Combine all URIs
+        const allTrackUris = [...validTrackUris, ...recommendedTrackUris];
+        
+        console.log(`[SUCCESS] Found ${validTracks.length} valid original tracks and ${recommendedTracks.length} recommended tracks`);
+        
+        // Add tracks to the playlist if we have any
+        if (allTrackUris.length > 0) {
+            console.log(`[INFO] Adding ${allTrackUris.length} total tracks to playlist`);
+            
+            // Log the first few URIs for debugging
+            console.log(`[DEBUG] First few URIs: ${allTrackUris.slice(0, 3).join(', ')}`);
+            
+            await axios.post(
                 `https://api.spotify.com/v1/playlists/${playlistId}/tracks`,
                 {
-                    uris: validTrackUris,
+                    uris: allTrackUris,
                 },
                 {
                     headers: {
@@ -208,15 +469,164 @@ app.post('/spotify/add-tracks', async (req, res) => {
                     }
                 }
             );
-
-            console.log('Spotify Add Tracks Response:', addTracksResponse.data);
-            res.json({ message: 'Tracks added to playlist' });
+            
+            // Return both valid original tracks and recommended tracks
+            res.json({
+                message: 'Tracks added to playlist',
+                stats: {
+                    originalRequested: stats.totalRequested,
+                    validOriginal: stats.validTracks,
+                    invalidOriginal: stats.invalidTracks,
+                    recommended: stats.recommendedTracks,
+                    totalAdded: allTrackUris.length
+                },
+                validOriginalTracks: validTracks.map(t => ({
+                    title: t.spotifyData.title,
+                    artist: t.spotifyData.artist,
+                    album: t.spotifyData.album,
+                    image: t.spotifyData.image
+                })),
+                recommendedTracks: recommendedTracks.map(t => ({
+                    title: t.spotifyData.title,
+                    artist: t.spotifyData.artist,
+                    album: t.spotifyData.album,
+                    image: t.spotifyData.image,
+                    recommended: true
+                }))
+            });
         } else {
-            res.status(404).json({ message: 'No valid tracks to add to the playlist.' });
+            console.log('[ERROR] No valid tracks found to add to the playlist');
+            res.status(404).json({ 
+                message: 'No valid tracks found to add to the playlist.',
+                stats
+            });
         }
     } catch (error) {
-        console.error('Error adding tracks to Spotify playlist:', error.response ? error.response.data : error.message);
-        res.status(500).json({ error: 'Failed to add tracks' });
+        console.error('[ERROR] Error adding tracks to Spotify playlist:', error.message);
+        res.status(500).json({ 
+            error: 'Failed to add tracks',
+            details: error.message
+        });
     }
 });
+
+// Get more tracks from the same artists
+async function getMoreTracksFromArtists(validTracks, accessToken, limit) {
+    const artistIds = [...new Set(validTracks
+        .filter(track => track.artist_id) // Make sure we have artist IDs
+        .map(track => track.artist_id))];
+    
+    if (artistIds.length === 0) return [];
+    
+    const artistTracks = [];
+    
+    // For each artist, get their top tracks
+    for (const artistId of artistIds.slice(0, 5)) { // Limit to 5 artists to avoid too many requests
+        try {
+            const response = await axios.get(`https://api.spotify.com/v1/artists/${artistId}/top-tracks`, {
+                headers: { 'Authorization': `Bearer ${accessToken}` },
+                params: { market: 'US' }
+            });
+            
+            if (response.data && response.data.tracks) {
+                // Filter out tracks that are already in our validated list
+                const newTracks = response.data.tracks
+                    .filter(track => !validTracks.some(vt => vt.id === track.id))
+                    .map(track => ({
+                        title: track.name,
+                        artist: track.artists[0].name,
+                        album: track.album.name,
+                        image: track.album.images[0]?.url,
+                        uri: track.uri,
+                        id: track.id,
+                        valid: true,
+                        recommended: true
+                    }));
+                
+                artistTracks.push(...newTracks);
+            }
+        } catch (error) {
+            console.error(`Error getting tracks for artist ${artistId}:`, error.message);
+        }
+    }
+    
+    return artistTracks.slice(0, limit);
+}
+
+// Get tracks by genre
+async function getTracksByGenre(validTracks, accessToken, limit) {
+    // First, get artist genres
+    const artistIds = [...new Set(validTracks
+        .filter(track => track.artist_id)
+        .map(track => track.artist_id))];
+    
+    if (artistIds.length === 0) return [];
+    
+    let genres = [];
+    
+    // Get genres for each artist
+    for (const artistId of artistIds.slice(0, 5)) {
+        try {
+            const response = await axios.get(`https://api.spotify.com/v1/artists/${artistId}`, {
+                headers: { 'Authorization': `Bearer ${accessToken}` }
+            });
+            
+            if (response.data && response.data.genres) {
+                genres.push(...response.data.genres);
+            }
+        } catch (error) {
+            console.error(`Error getting genres for artist ${artistId}:`, error.message);
+        }
+    }
+    
+    // Get the most common genres
+    const genreCounts = {};
+    genres.forEach(genre => {
+        genreCounts[genre] = (genreCounts[genre] || 0) + 1;
+    });
+    
+    const topGenres = Object.entries(genreCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(entry => entry[0]);
+    
+    if (topGenres.length === 0) return [];
+    
+    // Search for tracks in these genres
+    const genreTracks = [];
+    
+    for (const genre of topGenres) {
+        try {
+            const response = await axios.get(`https://api.spotify.com/v1/search`, {
+                headers: { 'Authorization': `Bearer ${accessToken}` },
+                params: {
+                    q: `genre:${genre}`,
+                    type: 'track',
+                    limit: Math.ceil(limit / topGenres.length)
+                }
+            });
+            
+            if (response.data && response.data.tracks && response.data.tracks.items) {
+                const newTracks = response.data.tracks.items
+                    .filter(track => !validTracks.some(vt => vt.id === track.id))
+                    .map(track => ({
+                        title: track.name,
+                        artist: track.artists[0].name,
+                        album: track.album.name,
+                        image: track.album.images[0]?.url,
+                        uri: track.uri,
+                        id: track.id,
+                        valid: true,
+                        recommended: true
+                    }));
+                
+                genreTracks.push(...newTracks);
+            }
+        } catch (error) {
+            console.error(`Error searching for tracks in genre ${genre}:`, error.message);
+        }
+    }
+    
+    return genreTracks.slice(0, limit);
+}
 
